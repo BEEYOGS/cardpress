@@ -27,6 +27,8 @@ const WIDTH = 1028;
 const HEIGHT = 650;
 const PRINT_PPI = 300;
 const SETTINGS_KEY = "cardpress.settings.v1";
+const DEFAULT_FORMAT_MIGRATION_KEY = "cardpress.default-format.code93.v1";
+const FULL_EAN_LAYOUT_MIGRATION_KEY = "cardpress.full-ean-layout.v2";
 const DB_NAME = "cardpress.templates.v1";
 const DB_STORE = "templates";
 
@@ -43,7 +45,7 @@ type Settings = {
   barWidth: number;
   barHeight: number;
   barFont: number;
-  barcodeFormat: "CODE128" | "CODE128C";
+  barcodeFormat: "EAN13" | "CODE93" | "CODE128" | "CODE128C" | "ITF14";
   numberFormat: "grouped" | "plain" | "none";
   mirror: boolean;
 };
@@ -52,12 +54,12 @@ const DEFAULTS: Settings = {
   frontX: 84,
   frontY: 116,
   frontFont: 34,
-  barX: 319,
-  barY: 380,
-  barWidth: 390,
-  barHeight: 110,
+  barX: 312,
+  barY: 370,
+  barWidth: 408,
+  barHeight: 130,
   barFont: 32,
-  barcodeFormat: "CODE128",
+  barcodeFormat: "CODE93",
   numberFormat: "grouped",
   mirror: false,
 };
@@ -123,11 +125,28 @@ function getNumbers(
   startText: string,
   countText: string,
   batch: string,
+  barcodeFormat: Settings["barcodeFormat"],
 ): { values: string[] } | { error: string } {
+  const validateItf14 = (value: string) => {
+    if (barcodeFormat !== "ITF14") return "";
+    if (!/^\d{14}$/.test(value)) return "ITF-14 memerlukan tepat 14 digit.";
+    const checkDigit = calculateItf14CheckDigit(value.slice(0, 13));
+    return value.endsWith(checkDigit) ? "" : `ITF-14 tidak valid. Digit cek seharusnya ${checkDigit}.`;
+  };
+  const validateEan13 = (value: string) => {
+    if (barcodeFormat !== "EAN13") return "";
+    if (!/^\d{13}$/.test(value)) return "EAN-13 memerlukan tepat 13 digit.";
+    const checkDigit = calculateEan13CheckDigit(value.slice(0, 12));
+    return value.endsWith(checkDigit) ? "" : `EAN-13 tidak valid. Digit cek seharusnya ${checkDigit}.`;
+  };
   if (mode === "single") {
     const value = single.trim();
     if (!value) return { error: "Nomor kode tidak boleh kosong." } as const;
     if (!/^\d+$/.test(value)) return { error: "Nomor kode hanya boleh berisi angka." } as const;
+    const eanError = validateEan13(value);
+    if (eanError) return { error: eanError } as const;
+    const itfError = validateItf14(value);
+    if (itfError) return { error: itfError } as const;
     return { values: [value] } as const;
   }
   if (mode === "sequence") {
@@ -136,6 +155,34 @@ function getNumbers(
     if (!/^\d+$/.test(start)) return { error: "Nomor awal harus berisi angka saja." } as const;
     if (!Number.isSafeInteger(count) || count < 1 || count > 10000) {
       return { error: "Jumlah kartu harus antara 1 dan 10.000." } as const;
+    }
+    if (barcodeFormat === "EAN13") {
+      if (!/^\d{13}$/.test(start)) return { error: "Nomor awal EAN-13 harus tepat 13 digit." } as const;
+      const startError = validateEan13(start);
+      if (startError) return { error: startError } as const;
+      const first = BigInt(start.slice(0, 12));
+      const last = (first + BigInt(count - 1)).toString();
+      if (last.length > 12) return { error: "Nomor urutan melampaui 12 digit data EAN-13." } as const;
+      return {
+        values: Array.from({ length: count }, (_, index) => {
+          const data = (first + BigInt(index)).toString().padStart(12, "0");
+          return `${data}${calculateEan13CheckDigit(data)}`;
+        }),
+      } as const;
+    }
+    if (barcodeFormat === "ITF14") {
+      if (!/^\d{14}$/.test(start)) return { error: "Nomor awal ITF-14 harus tepat 14 digit." } as const;
+      const startError = validateItf14(start);
+      if (startError) return { error: startError } as const;
+      const first = BigInt(start.slice(0, 13));
+      const last = (first + BigInt(count - 1)).toString();
+      if (last.length > 13) return { error: "Nomor urutan melampaui 13 digit data ITF-14." } as const;
+      return {
+        values: Array.from({ length: count }, (_, index) => {
+          const data = (first + BigInt(index)).toString().padStart(13, "0");
+          return `${data}${calculateItf14CheckDigit(data)}`;
+        }),
+      } as const;
     }
     const first = BigInt(start);
     if ((first + BigInt(count - 1)).toString().length > start.length) {
@@ -149,11 +196,35 @@ function getNumbers(
   if (!lines.length) return { error: "Tempel setidaknya satu nomor untuk membuat kartu." } as const;
   const invalid = lines.findIndex((line) => !/^\d+$/.test(line));
   if (invalid !== -1) return { error: `Baris ${invalid + 1} berisi karakter selain angka.` } as const;
+  if (barcodeFormat === "ITF14") {
+    const invalidItf = lines.findIndex((line) => validateItf14(line));
+    if (invalidItf !== -1) return { error: `Baris ${invalidItf + 1}: ${validateItf14(lines[invalidItf])}` } as const;
+  }
+  if (barcodeFormat === "EAN13") {
+    const invalidEan = lines.findIndex((line) => validateEan13(line));
+    if (invalidEan !== -1) return { error: `Baris ${invalidEan + 1}: ${validateEan13(lines[invalidEan])}` } as const;
+  }
   return { values: lines } as const;
 }
 
 function groupedNumber(value: string) {
   return value.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
+
+function calculateItf14CheckDigit(value: string) {
+  const sum = Array.from(value).reduce(
+    (total, digit, index) => total + Number(digit) * (index % 2 === 0 ? 3 : 1),
+    0,
+  );
+  return String((10 - (sum % 10)) % 10);
+}
+
+function calculateEan13CheckDigit(value: string) {
+  const sum = Array.from(value).reduce(
+    (total, digit, index) => total + Number(digit) * (index % 2 === 0 ? 1 : 3),
+    0,
+  );
+  return String((10 - (sum % 10)) % 10);
 }
 
 function drawImageCover(ctx: CanvasRenderingContext2D, image: HTMLImageElement) {
@@ -199,20 +270,39 @@ async function renderBack(
   drawTemplate(ctx, template);
   const { barX: x, barY: y, barWidth: width, barHeight: totalHeight, barFont: textSize } = settings;
   const showText = settings.numberFormat !== "none" && textSize > 0;
-  const textHeight = showText ? Math.min(totalHeight * 0.35, textSize + 9) : 0;
+  const isCode93 = settings.barcodeFormat === "CODE93";
+  const captionScale = settings.barcodeFormat === "EAN13" || isCode93 ? 0.8 : 1;
+  const captionHeight = isCode93 ? textSize * captionScale : textSize;
+  const textHeight = showText ? Math.min(totalHeight * 0.35, captionHeight + 9) : 0;
   const barHeight = Math.max(12, totalHeight - textHeight);
   if (settings.barcodeFormat === "CODE128C" && (!/^\d+$/.test(number) || number.length % 2 !== 0)) {
     throw new Error("CODE128C memerlukan jumlah digit genap. Pilih CODE128 Auto atau ubah nomor.");
+  }
+  if (settings.barcodeFormat === "EAN13") {
+    if (!/^\d{13}$/.test(number)) {
+      throw new Error("EAN-13 memerlukan tepat 13 digit.");
+    }
+    if (number !== `${number.slice(0, 12)}${calculateEan13CheckDigit(number.slice(0, 12))}`) {
+      throw new Error("Nomor EAN-13 memiliki digit cek yang tidak valid.");
+    }
+  }
+  if (settings.barcodeFormat === "ITF14") {
+    if (!/^\d{14}$/.test(number)) {
+      throw new Error("ITF-14 memerlukan tepat 14 digit.");
+    }
+    if (number !== `${number.slice(0, 13)}${calculateItf14CheckDigit(number.slice(0, 13))}`) {
+      throw new Error("Nomor ITF-14 memiliki digit cek yang tidak valid.");
+    }
   }
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   try {
     JsBarcode(svg, number, {
       format: settings.barcodeFormat,
       displayValue: false,
-      margin: 0,
-      width: 3,
+      margin: settings.barcodeFormat === "EAN13" || isCode93 ? 10 : 30,
+      width: settings.barcodeFormat === "EAN13" ? 6 : isCode93 ? 4 : 3,
       height: barHeight,
-      background: "#ffffff",
+      background: "transparent",
       lineColor: "#000000",
     });
   } catch {
@@ -227,10 +317,11 @@ async function renderBack(
       ctx.translate(WIDTH, 0);
       ctx.scale(-1, 1);
     }
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(x, y, width, totalHeight);
-    const maxBarWidth = width * 0.82;
-    const drawnHeight = barHeight;
+    const eanScale = settings.barcodeFormat === "EAN13" ? 0.8 : 1;
+    const code93WidthScale = isCode93 ? 0.92 : 1;
+    const code93HeightScale = isCode93 ? 0.9 : 1;
+    const maxBarWidth = width * (settings.barcodeFormat === "EAN13" ? eanScale : isCode93 ? code93WidthScale : 0.92);
+    const drawnHeight = barHeight * (settings.barcodeFormat === "EAN13" ? eanScale : code93HeightScale);
     const drawnWidth = Math.min(maxBarWidth, barcode.image.naturalWidth * (drawnHeight / barcode.image.naturalHeight));
     const barcodeX = x + (width - drawnWidth) / 2;
     const barcodeY = y + Math.max(3, (barHeight - drawnHeight) / 2);
@@ -238,12 +329,24 @@ async function renderBack(
     ctx.drawImage(barcode.image, barcodeX, barcodeY, drawnWidth, drawnHeight);
     ctx.imageSmoothingEnabled = true;
     if (showText) {
+      const captionSize = textSize * (isCode93 ? captionScale : eanScale);
       ctx.fillStyle = "#111111";
-      ctx.font = `700 ${textSize}px Arial, Helvetica, sans-serif`;
+      ctx.font = `700 ${captionSize}px Arial, Helvetica, sans-serif`;
       ctx.textAlign = "center";
       ctx.textBaseline = "alphabetic";
-      const caption = settings.numberFormat === "grouped" ? groupedNumber(number) : number;
-      ctx.fillText(caption, barcodeX + drawnWidth / 2, y + totalHeight - Math.max(5, (textHeight - textSize) / 2), Math.max(1, drawnWidth));
+      const captionY = settings.barcodeFormat === "EAN13" || isCode93
+        ? barcodeY + drawnHeight + captionSize * 0.9
+        : y + totalHeight - Math.max(5, (textHeight - textSize) / 2);
+      if (settings.barcodeFormat === "EAN13") {
+        ctx.textAlign = "left";
+        ctx.fillText(number[0], Math.max(x + 4, barcodeX - captionSize * 1.15), captionY, captionSize);
+        ctx.textAlign = "center";
+        ctx.fillText(number.slice(1, 7), barcodeX + drawnWidth * 0.31, captionY, drawnWidth * 0.46);
+        ctx.fillText(number.slice(7), barcodeX + drawnWidth * 0.80, captionY, drawnWidth * 0.38);
+      } else {
+        const caption = settings.numberFormat === "grouped" ? groupedNumber(number) : number;
+        ctx.fillText(caption, barcodeX + drawnWidth / 2, captionY, Math.max(1, drawnWidth));
+      }
     }
     ctx.restore();
   } finally {
@@ -526,8 +629,8 @@ export default function Home() {
   const [oneSidedSide, setOneSidedSide] = useState<Side>("back");
   const [templates, setTemplates] = useState<Record<Side, Template | null>>({ front: null, back: null });
   const [settings, setSettings] = useState<Settings>(DEFAULTS);
-  const [singleNumber, setSingleNumber] = useState("1111199999903");
-  const [startNumber, setStartNumber] = useState("1111111000801");
+  const [singleNumber, setSingleNumber] = useState("8997007770017");
+  const [startNumber, setStartNumber] = useState("8997007770017");
   const [sequenceCount, setSequenceCount] = useState("50");
   const [batchNumbers, setBatchNumbers] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -540,8 +643,8 @@ export default function Home() {
   const [ready, setReady] = useState(false);
 
   const parsed = useMemo(
-    () => getNumbers(mode, singleNumber, startNumber, sequenceCount, batchNumbers),
-    [mode, singleNumber, startNumber, sequenceCount, batchNumbers],
+    () => getNumbers(mode, singleNumber, startNumber, sequenceCount, batchNumbers, settings.barcodeFormat),
+    [mode, singleNumber, startNumber, sequenceCount, batchNumbers, settings.barcodeFormat],
   );
   const numbers: string[] = "values" in parsed ? parsed.values : [];
   const currentNumber = numbers[selectedIndex] ?? numbers[0] ?? "";
@@ -569,7 +672,20 @@ export default function Home() {
         if (savedSettings) {
           try {
             const values = JSON.parse(savedSettings) as Partial<Settings>;
-            setSettings({ ...DEFAULTS, ...values });
+            const migratedFormat = localStorage.getItem(DEFAULT_FORMAT_MIGRATION_KEY) !== "done";
+            const migratedLayout = localStorage.getItem(FULL_EAN_LAYOUT_MIGRATION_KEY) !== "done";
+            setSettings({
+              ...DEFAULTS,
+              ...values,
+              barcodeFormat: migratedFormat ? "CODE93" : (values.barcodeFormat ?? "CODE93"),
+              barX: migratedLayout ? DEFAULTS.barX : (values.barX ?? DEFAULTS.barX),
+              barY: migratedLayout ? DEFAULTS.barY : (values.barY ?? DEFAULTS.barY),
+              barWidth: migratedLayout ? DEFAULTS.barWidth : (values.barWidth ?? DEFAULTS.barWidth),
+              barHeight: migratedLayout ? DEFAULTS.barHeight : (values.barHeight ?? DEFAULTS.barHeight),
+              barFont: migratedLayout ? DEFAULTS.barFont : (values.barFont ?? DEFAULTS.barFont),
+            });
+            if (migratedFormat) localStorage.setItem(DEFAULT_FORMAT_MIGRATION_KEY, "done");
+            if (migratedLayout) localStorage.setItem(FULL_EAN_LAYOUT_MIGRATION_KEY, "done");
           } catch (settingsError) {
             console.warn("Pengaturan tersimpan tidak dapat dibaca:", settingsError);
           }
@@ -583,7 +699,16 @@ export default function Home() {
         const storedSides = new Set<Side>();
         for (const [side, entry] of saved) {
           if (!active) return;
-          await installTemplate(side, entry.blob, entry.name || "Template tersimpan", false);
+          if (side === "back" && entry.name === "template belakang.jpg") {
+            const response = await fetch("/templates/back.jpg");
+            if (!response.ok) throw new Error("Template belakang baru tidak dapat dimuat.");
+            const blob = await response.blob();
+            const name = "template belakang baru.jpg";
+            await installTemplate(side, blob, name, false);
+            await storeTemplate(side, blob, name);
+          } else {
+            await installTemplate(side, entry.blob, entry.name || "Template tersimpan", false);
+          }
           storedSides.add(side);
         }
         for (const side of ["front", "back"] as const) {
@@ -591,7 +716,7 @@ export default function Home() {
           const response = await fetch(side === "front" ? "/templates/front.jpg" : "/templates/back.jpg");
           if (!response.ok) throw new Error(`Template ${side === "front" ? "depan" : "belakang"} tidak dapat dimuat.`);
           const blob = await response.blob();
-          const name = side === "front" ? "template depan.jpg" : "template belakang.jpg";
+          const name = side === "front" ? "template depan.jpg" : "template belakang baru.jpg";
           await installTemplate(side, blob, name, false);
           await storeTemplate(side, blob, name);
         }
@@ -779,6 +904,18 @@ export default function Home() {
       showToast("CODE128C memerlukan nomor dengan jumlah digit genap.");
       return;
     }
+    if (outputSides.includes("back") && settings.barcodeFormat === "ITF14" && parsed.values.some((number) => {
+      return !/^\d{14}$/.test(number) || number !== `${number.slice(0, 13)}${calculateItf14CheckDigit(number.slice(0, 13))}`;
+    })) {
+      showToast("Semua nomor untuk ITF-14 harus terdiri dari 14 digit dengan digit cek yang valid.");
+      return;
+    }
+    if (outputSides.includes("back") && settings.barcodeFormat === "EAN13" && parsed.values.some((number) => {
+      return !/^\d{13}$/.test(number) || number !== `${number.slice(0, 12)}${calculateEan13CheckDigit(number.slice(0, 12))}`;
+    })) {
+      showToast("Semua nomor untuk EAN-13 harus terdiri dari 13 digit dengan digit cek yang valid.");
+      return;
+    }
     setExporting(true);
     setProgress(0);
     setProgressLabel("Menyiapkan kartu...");
@@ -911,7 +1048,7 @@ export default function Home() {
                   </div>
                   <div className="field">
                     <label htmlFor="batchNumbers">Daftar nomor <span className="font-normal text-[var(--muted)]">satu nomor per baris</span></label>
-                    <textarea id="batchNumbers" spellCheck={false} placeholder={"1111111000801\n1111111000802\n1111111000803"} value={batchNumbers} onChange={(event) => setBatchNumbers(event.target.value)} />
+                    <textarea id="batchNumbers" spellCheck={false} placeholder={"8997007770017\n8997007770024\n8997007770031"} value={batchNumbers} onChange={(event) => setBatchNumbers(event.target.value)} />
                   </div>
                 </div>
               )}
@@ -930,7 +1067,7 @@ export default function Home() {
               </div>
             </div>
             <div className="cal-section">
-              <div className="cal-title"><strong>Barcode · belakang</strong><span>CODE128</span></div>
+              <div className="cal-title"><strong>Barcode · belakang</strong><span>{settings.barcodeFormat === "ITF14" ? "ITF-14" : settings.barcodeFormat === "EAN13" ? "EAN-13" : settings.barcodeFormat === "CODE93" ? "Code 93" : settings.barcodeFormat}</span></div>
               <div className="cal-grid">
                 <RangeControl id="barX" label="Posisi X" min={0} max={638} value={settings.barX} onChange={(value) => updateSetting("barX", value)} />
                 <RangeControl id="barY" label="Posisi Y" min={0} max={540} value={settings.barY} onChange={(value) => updateSetting("barY", value)} />
@@ -945,7 +1082,13 @@ export default function Home() {
                 <CustomSelect<Settings["barcodeFormat"]>
                   id="barcodeFormat"
                   value={settings.barcodeFormat}
-                  options={[{ value: "CODE128", label: "CODE128 Auto" }, { value: "CODE128C", label: "CODE128C · angka genap" }]}
+                  options={[
+                    { value: "CODE93", label: "Code 93" },
+                    { value: "EAN13", label: "EAN-13 · 13 digit" },
+                    { value: "CODE128", label: "CODE128 Auto" },
+                    { value: "CODE128C", label: "CODE128C · angka genap" },
+                    { value: "ITF14", label: "ITF-14 · 14 digit" },
+                  ]}
                   onChange={(value) => updateSetting("barcodeFormat", value)}
                 />
               </div>
