@@ -28,9 +28,15 @@ const HEIGHT = 650;
 const PRINT_PPI = 300;
 const SETTINGS_KEY = "cardpress.settings.v1";
 const DEFAULT_FORMAT_MIGRATION_KEY = "cardpress.default-format.code93.v1";
-const FULL_EAN_LAYOUT_MIGRATION_KEY = "cardpress.full-ean-layout.v2";
+const FULL_EAN_LAYOUT_MIGRATION_KEY = "cardpress.full-ean-layout.v3";
 const DB_NAME = "cardpress.templates.v1";
 const DB_STORE = "templates";
+const CODE128_AUTO_REFERENCE_LAYOUT = {
+  barsHeight: 0.43,
+  top: 0.18,
+  captionBaseline: 0.86,
+  captionScale: 0.8,
+} as const;
 
 type Side = "front" | "back";
 type Mode = "single" | "sequence" | "batch";
@@ -54,10 +60,10 @@ const DEFAULTS: Settings = {
   frontX: 84,
   frontY: 116,
   frontFont: 34,
-  barX: 312,
+  barX: 307,
   barY: 370,
-  barWidth: 408,
-  barHeight: 130,
+  barWidth: 415,
+  barHeight: 126,
   barFont: 32,
   barcodeFormat: "CODE93",
   numberFormat: "grouped",
@@ -139,10 +145,18 @@ function getNumbers(
     const checkDigit = calculateEan13CheckDigit(value.slice(0, 12));
     return value.endsWith(checkDigit) ? "" : `EAN-13 tidak valid. Digit cek seharusnya ${checkDigit}.`;
   };
+  const validateCode128C = (value: string) => {
+    if (barcodeFormat !== "CODE128C") return "";
+    return /^\d+$/.test(value) && value.length % 2 === 0
+      ? ""
+      : "Code 128 C memerlukan angka dengan jumlah digit genap.";
+  };
   if (mode === "single") {
     const value = single.trim();
     if (!value) return { error: "Nomor kode tidak boleh kosong." } as const;
     if (!/^\d+$/.test(value)) return { error: "Nomor kode hanya boleh berisi angka." } as const;
+    const code128CError = validateCode128C(value);
+    if (code128CError) return { error: code128CError } as const;
     const eanError = validateEan13(value);
     if (eanError) return { error: eanError } as const;
     const itfError = validateItf14(value);
@@ -156,6 +170,8 @@ function getNumbers(
     if (!Number.isSafeInteger(count) || count < 1 || count > 10000) {
       return { error: "Jumlah kartu harus antara 1 dan 10.000." } as const;
     }
+    const code128CError = validateCode128C(start);
+    if (code128CError) return { error: code128CError } as const;
     if (barcodeFormat === "EAN13") {
       if (!/^\d{13}$/.test(start)) return { error: "Nomor awal EAN-13 harus tepat 13 digit." } as const;
       const startError = validateEan13(start);
@@ -196,6 +212,8 @@ function getNumbers(
   if (!lines.length) return { error: "Tempel setidaknya satu nomor untuk membuat kartu." } as const;
   const invalid = lines.findIndex((line) => !/^\d+$/.test(line));
   if (invalid !== -1) return { error: `Baris ${invalid + 1} berisi karakter selain angka.` } as const;
+  const invalidCode128C = lines.findIndex((line) => validateCode128C(line));
+  if (invalidCode128C !== -1) return { error: `Baris ${invalidCode128C + 1}: ${validateCode128C(lines[invalidCode128C])}` } as const;
   if (barcodeFormat === "ITF14") {
     const invalidItf = lines.findIndex((line) => validateItf14(line));
     if (invalidItf !== -1) return { error: `Baris ${invalidItf + 1}: ${validateItf14(lines[invalidItf])}` } as const;
@@ -208,7 +226,7 @@ function getNumbers(
 }
 
 function groupedNumber(value: string) {
-  return value.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+  return value.replace(/(\d{3})(?=\d)/g, "$1 ");
 }
 
 function calculateItf14CheckDigit(value: string) {
@@ -271,12 +289,15 @@ async function renderBack(
   const { barX: x, barY: y, barWidth: width, barHeight: totalHeight, barFont: textSize } = settings;
   const showText = settings.numberFormat !== "none" && textSize > 0;
   const isCode93 = settings.barcodeFormat === "CODE93";
-  const captionScale = settings.barcodeFormat === "EAN13" || isCode93 ? 0.8 : 1;
-  const captionHeight = isCode93 ? textSize * captionScale : textSize;
+  const isCode128Auto = settings.barcodeFormat === "CODE128";
+  const captionScale = settings.barcodeFormat === "EAN13" || isCode93
+    ? 0.8
+    : isCode128Auto ? CODE128_AUTO_REFERENCE_LAYOUT.captionScale : 1;
+  const captionHeight = isCode93 || isCode128Auto ? textSize * captionScale : textSize;
   const textHeight = showText ? Math.min(totalHeight * 0.35, captionHeight + 9) : 0;
   const barHeight = Math.max(12, totalHeight - textHeight);
   if (settings.barcodeFormat === "CODE128C" && (!/^\d+$/.test(number) || number.length % 2 !== 0)) {
-    throw new Error("CODE128C memerlukan jumlah digit genap. Pilih CODE128 Auto atau ubah nomor.");
+    throw new Error("Code 128 C memerlukan angka dengan jumlah digit genap. Pilih CODE128 Auto atau ubah nomor.");
   }
   if (settings.barcodeFormat === "EAN13") {
     if (!/^\d{13}$/.test(number)) {
@@ -295,11 +316,16 @@ async function renderBack(
     }
   }
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const barcodeMargin = settings.barcodeFormat === "EAN13" || isCode93 ? 10 : 30;
   try {
     JsBarcode(svg, number, {
       format: settings.barcodeFormat,
       displayValue: false,
-      margin: settings.barcodeFormat === "EAN13" || isCode93 ? 10 : 30,
+      margin: isCode128Auto ? 0 : barcodeMargin,
+      marginTop: isCode128Auto ? 0 : undefined,
+      marginBottom: isCode128Auto ? 0 : undefined,
+      marginLeft: isCode128Auto ? barcodeMargin : undefined,
+      marginRight: isCode128Auto ? barcodeMargin : undefined,
       width: settings.barcodeFormat === "EAN13" ? 6 : isCode93 ? 4 : 3,
       height: barHeight,
       background: "transparent",
@@ -321,22 +347,31 @@ async function renderBack(
     const code93WidthScale = isCode93 ? 0.92 : 1;
     const code93HeightScale = isCode93 ? 0.9 : 1;
     const maxBarWidth = width * (settings.barcodeFormat === "EAN13" ? eanScale : isCode93 ? code93WidthScale : 0.92);
-    const drawnHeight = barHeight * (settings.barcodeFormat === "EAN13" ? eanScale : code93HeightScale);
-    const drawnWidth = Math.min(maxBarWidth, barcode.image.naturalWidth * (drawnHeight / barcode.image.naturalHeight));
+    const drawnHeight = isCode128Auto
+      ? totalHeight * CODE128_AUTO_REFERENCE_LAYOUT.barsHeight
+      : barHeight * (settings.barcodeFormat === "EAN13" ? eanScale : code93HeightScale);
+    const drawnWidth = Math.min(
+      maxBarWidth,
+      barcode.image.naturalWidth * (isCode128Auto ? 1 : drawnHeight / barcode.image.naturalHeight),
+    );
     const barcodeX = x + (width - drawnWidth) / 2;
-    const barcodeY = y + Math.max(3, (barHeight - drawnHeight) / 2);
+    const barcodeY = isCode128Auto
+      ? y + totalHeight * CODE128_AUTO_REFERENCE_LAYOUT.top
+      : y + Math.max(3, (barHeight - drawnHeight) / 2);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(barcode.image, barcodeX, barcodeY, drawnWidth, drawnHeight);
     ctx.imageSmoothingEnabled = true;
     if (showText) {
-      const captionSize = textSize * (isCode93 ? captionScale : eanScale);
+      const captionSize = textSize * (isCode93 || isCode128Auto ? captionScale : eanScale);
       ctx.fillStyle = "#111111";
       ctx.font = `700 ${captionSize}px Arial, Helvetica, sans-serif`;
       ctx.textAlign = "center";
       ctx.textBaseline = "alphabetic";
-      const captionY = settings.barcodeFormat === "EAN13" || isCode93
-        ? barcodeY + drawnHeight + captionSize * 0.9
-        : y + totalHeight - Math.max(5, (textHeight - textSize) / 2);
+      const captionY = isCode128Auto
+        ? y + totalHeight * CODE128_AUTO_REFERENCE_LAYOUT.captionBaseline
+        : settings.barcodeFormat === "EAN13" || isCode93
+          ? barcodeY + drawnHeight + captionSize * 0.9
+          : y + totalHeight - Math.max(5, (textHeight - textSize) / 2);
       if (settings.barcodeFormat === "EAN13") {
         ctx.textAlign = "left";
         ctx.fillText(number[0], Math.max(x + 4, barcodeX - captionSize * 1.15), captionY, captionSize);
@@ -901,7 +936,7 @@ export default function Home() {
       return;
     }
     if (outputSides.includes("back") && settings.barcodeFormat === "CODE128C" && parsed.values.some((number) => !/^\d+$/.test(number) || number.length % 2 !== 0)) {
-      showToast("CODE128C memerlukan nomor dengan jumlah digit genap.");
+      showToast("Code 128 C memerlukan nomor dengan jumlah digit genap.");
       return;
     }
     if (outputSides.includes("back") && settings.barcodeFormat === "ITF14" && parsed.values.some((number) => {
@@ -1067,7 +1102,7 @@ export default function Home() {
               </div>
             </div>
             <div className="cal-section">
-              <div className="cal-title"><strong>Barcode · belakang</strong><span>{settings.barcodeFormat === "ITF14" ? "ITF-14" : settings.barcodeFormat === "EAN13" ? "EAN-13" : settings.barcodeFormat === "CODE93" ? "Code 93" : settings.barcodeFormat}</span></div>
+              <div className="cal-title"><strong>Barcode · belakang</strong><span>{settings.barcodeFormat === "ITF14" ? "ITF-14" : settings.barcodeFormat === "EAN13" ? "EAN-13" : settings.barcodeFormat === "CODE93" ? "Code 93" : settings.barcodeFormat === "CODE128" ? "Code 128 Auto" : settings.barcodeFormat === "CODE128C" ? "Code 128 C" : settings.barcodeFormat}</span></div>
               <div className="cal-grid">
                 <RangeControl id="barX" label="Posisi X" min={0} max={638} value={settings.barX} onChange={(value) => updateSetting("barX", value)} />
                 <RangeControl id="barY" label="Posisi Y" min={0} max={540} value={settings.barY} onChange={(value) => updateSetting("barY", value)} />
@@ -1085,12 +1120,17 @@ export default function Home() {
                   options={[
                     { value: "CODE93", label: "Code 93" },
                     { value: "EAN13", label: "EAN-13 · 13 digit" },
-                    { value: "CODE128", label: "CODE128 Auto" },
-                    { value: "CODE128C", label: "CODE128C · angka genap" },
+                    { value: "CODE128", label: "Code 128 Auto · Set C/B" },
+                    { value: "CODE128C", label: "Code 128 C · angka genap" },
                     { value: "ITF14", label: "ITF-14 · 14 digit" },
                   ]}
                   onChange={(value) => updateSetting("barcodeFormat", value)}
                 />
+                {settings.barcodeFormat === "CODE128" && (
+                  <p className="muted-note">
+                    Untuk 13 digit, otomatis memakai Set C untuk 12 digit pertama dan Set B untuk digit terakhir.
+                  </p>
+                )}
               </div>
               <div className="field">
                 <label htmlFor="numberFormat">Teks angka bawah</label>
